@@ -9011,6 +9011,14 @@ class GatewayRunner(GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
                         logger.debug("trailing footer send failed: %s", _e)
                 return None
 
+            # Suppress delivery when the agent explicitly signals silence.
+            if response.strip() == "[SILENT]":
+                logger.info(
+                    "response suppressed by agent: platform=%s chat=%s",
+                    _platform_name, source.chat_id or "unknown",
+                )
+                return None
+
             return response
             
         except Exception as e:
