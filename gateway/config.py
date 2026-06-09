@@ -699,6 +699,9 @@ class GatewayConfig:
         return "public"
 
 
+yaml_cfg = None
+
+
 def load_gateway_config() -> GatewayConfig:
     """
     Load gateway configuration from multiple sources.
@@ -732,6 +735,7 @@ def load_gateway_config() -> GatewayConfig:
         config_yaml_path = _home / "config.yaml"
         if config_yaml_path.exists():
             with open(config_yaml_path, encoding="utf-8") as f:
+                global yaml_cfg
                 yaml_cfg = yaml.safe_load(f) or {}
 
             # Map config.yaml keys → GatewayConfig.from_dict() schema.
@@ -1636,6 +1640,13 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             "domain": os.getenv("FEISHU_DOMAIN", "feishu"),
             "connection_mode": os.getenv("FEISHU_CONNECTION_MODE", "websocket"),
         })
+        # Merge known_bot_names from top-level feishu YAML config (they are
+        # NOT inside platforms: so GatewayConfig.from_dict skips them).
+        feishu_yaml = (yaml_cfg or {}).get("feishu", {})
+        if isinstance(feishu_yaml, dict):
+            yaml_extra = feishu_yaml.get("extra", {})
+            if isinstance(yaml_extra, dict) and "known_bot_names" in yaml_extra:
+                config.platforms[Platform.FEISHU].extra["known_bot_names"] = dict(yaml_extra["known_bot_names"])
         feishu_encrypt_key = os.getenv("FEISHU_ENCRYPT_KEY", "")
         if feishu_encrypt_key:
             config.platforms[Platform.FEISHU].extra["encrypt_key"] = feishu_encrypt_key

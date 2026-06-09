@@ -1474,6 +1474,12 @@ class FeishuAdapter(BasePlatformAdapter):
         # by create, so we cache it per message_id.
         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
         self._load_seen_message_ids()
+        # Bot-to-bot reply tracking: chat_id → {"open_id": ..., "name": ...}
+        self._bot_reply_targets: Dict[str, Dict[str, str]] = {}
+        # Known bot open_id → name mapping from config.yaml feishu.known_bot_names
+        _raw_known = (config.extra or {}).get("known_bot_names", {})
+        self._known_bot_names: Dict[str, str] = dict(_raw_known) if isinstance(_raw_known, dict) else {}
+        logger.info(f"[Feishu] _known_bot_names loaded: {self._known_bot_names}")
 
     @staticmethod
     def _load_settings(extra: Dict[str, Any]) -> FeishuAdapterSettings:
@@ -1786,8 +1792,13 @@ class FeishuAdapter(BasePlatformAdapter):
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         last_response = None
 
+        logger.info("[Feishu] send() called: chat_id=%s reply_to=%s content_len=%d chunks=%d",
+                    chat_id, reply_to, len(content), len(chunks))
+
         try:
+            all_text = ""
             for chunk in chunks:
+                all_text += chunk
                 msg_type, payload = self._build_outbound_payload(chunk)
                 try:
                     response = await self._feishu_send_with_retry(
@@ -1822,6 +1833,39 @@ class FeishuAdapter(BasePlatformAdapter):
                         metadata=metadata,
                     )
                 last_response = response
+
+            # Bot-to-bot auto @mention: if replying to a bot and no <at> tag in
+            # any chunk, append a trailing @mention so the target bot receives it.
+            target = self._bot_reply_targets.pop(reply_to, None) if reply_to else None
+            if target:
+                open_id = target.get("open_id")
+                name = target.get("name")
+                if open_id and "<at" not in all_text:
+                    at_text = f'<at user_id="{open_id}">@{name}</at> 👋'
+                    at_payload = json.dumps({"text": at_text}, ensure_ascii=False)
+                    logger.info("[Feishu] Auto @mention: reply_to=%s target=%s has_at=%s",
+                                reply_to, name, "<at" in all_text)
+                    try:
+                        response = await self._feishu_send_with_retry(
+                            chat_id=chat_id,
+                            msg_type="text",
+                            payload=at_payload,
+                            reply_to=None,
+                            metadata=metadata,
+                        )
+                        ok = self._response_succeeded(response)
+                        logger.info("[Feishu] Auto @mention %s: target=%s code=%s",
+                                    "OK" if ok else "FAILED", name,
+                                    getattr(response, "code", None) if response else None)
+                    except Exception:
+                        logger.warning("[Feishu] Auto @mention failed for %s", name, exc_info=True)
+                else:
+                    logger.info("[Feishu] Auto @mention SKIP: open_id=%s has_at=%s reply_to=%s keys=%s",
+                                bool(open_id), "<at" in all_text, reply_to, list(self._bot_reply_targets.keys()))
+            else:
+                if reply_to:
+                    logger.info("[Feishu] Auto @mention NO TARGET: reply_to=%s keys=%s",
+                                reply_to, list(self._bot_reply_targets.keys()))
 
             return self._finalize_send_result(last_response, "send failed")
         except Exception as exc:
@@ -3152,6 +3196,22 @@ class FeishuAdapter(BasePlatformAdapter):
         chat_id = getattr(message, "chat_id", "") or ""
         chat_info = await self.get_chat_info(chat_id)
         sender_profile = await self._resolve_sender_profile(sender_id, is_bot=is_bot)
+
+        # Bot-to-bot: track reply target for auto-@mention and inject chat context
+        if is_bot and chat_type == "group":
+            sender_open_id = getattr(sender_id, "open_id", None) or None
+            sender_name = self._known_bot_names.get(sender_open_id) or sender_profile.get("user_name") or "Bot"
+            if sender_open_id:
+                self._bot_reply_targets[message_id] = {
+                    "open_id": sender_open_id,
+                    "name": sender_name,
+                }
+                logger.info("[Feishu] Bot reply target stored: msg_id=%s name=%s open_id=%s",
+                            message_id, sender_name, sender_open_id)
+            # Fetch recent messages as context
+            chat_context = await self._fetch_chat_context_sync(chat_id=chat_id)
+            if chat_context:
+                text = f"[群聊上下文]\n{chat_context}\n---\n{text}"
         source = self.build_source(
             chat_id=chat_id,
             chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
@@ -4053,6 +4113,86 @@ class FeishuAdapter(BasePlatformAdapter):
             return text
         except Exception:
             logger.warning("[Feishu] Failed to fetch parent message %s", message_id, exc_info=True)
+            return None
+
+    # Maximum number of recent messages to fetch for bot-to-bot chat context.
+    _CHAT_CONTEXT_LIMIT = 7
+    # Known bot open_id → display name mapping (used when API name resolution fails).
+    _KNOWN_BOT_NAMES: Dict[str, str] = {}
+
+    async def _fetch_chat_context_sync(self, *, chat_id: str) -> Optional[str]:
+        """Fetch recent messages from a group chat as context for bot-to-bot replies.
+
+        Returns a string like:
+          豆包包3号: 2姐帮我看看这个
+          好运宝宝: 这是什么？
+        or None on failure.
+        """
+        if "BaseRequest" not in globals():
+            return None
+        try:
+            req = (
+                BaseRequest.builder()
+                .http_method(HttpMethod.GET)
+                .uri("/open-apis/im/v1/messages")
+                .queries([
+                    ("container_id_type", "chat"),
+                    ("container_id", chat_id),
+                    ("page_size", str(self._CHAT_CONTEXT_LIMIT)),
+                    ("sort_type", "ByCreateTimeDesc"),
+                ])
+                .token_types({AccessTokenType.TENANT})
+                .build()
+            )
+            resp = await asyncio.to_thread(self._client.request, req)
+            content = getattr(getattr(resp, "raw", None), "content", None)
+            if not content:
+                logger.debug("[Feishu] _fetch_chat_context_sync: empty response")
+                return None
+            payload = json.loads(content)
+            if payload.get("code") != 0:
+                logger.debug("[Feishu] _fetch_chat_context_sync: API error code=%s", payload.get("code"))
+                return None
+            items = (payload.get("data") or {}).get("items") or []
+            if not items:
+                return None
+
+            lines = []
+            self_app_id = self._app_id or ""
+            for msg in reversed(items):  # oldest first
+                sender = msg.get("sender") or {}
+                sender_app_id = sender.get("id", "")
+                sender_type = sender.get("sender_type", "")
+                # Skip own messages
+                if sender_type == "app" and sender_app_id == self_app_id:
+                    continue
+                sender_name = sender.get("sender_id", {}).get("name", "") if hasattr(sender, 'get') else ""
+                # Try to extract name from mentions or sender info
+                name = ""
+                mentions = msg.get("mentions") or []
+                for m in mentions:
+                    if m.get("id") == sender_app_id:
+                        name = m.get("name", "")
+                        break
+                if not name:
+                    name = sender_type
+                body = msg.get("body") or {}
+                raw_content = body.get("content", "")
+                msg_type = msg.get("msg_type", "text")
+                text = self._extract_text_from_raw_content(
+                    msg_type=msg_type,
+                    raw_content=raw_content,
+                    mentions=mentions,
+                )
+                if not text:
+                    continue
+                lines.append(f"{name}: {text}")
+
+            if not lines:
+                return None
+            return "\n".join(lines)
+        except Exception:
+            logger.debug("[Feishu] _fetch_chat_context_sync failed", exc_info=True)
             return None
 
     def _extract_text_from_raw_content(
