@@ -65,7 +65,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Literal, Optional, Sequence
+from typing import Any, Dict, List, Literal, Optional, Sequence, Set
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -1478,6 +1478,9 @@ class FeishuAdapter(BasePlatformAdapter):
         self._bot_reply_targets: Dict[str, Dict[str, str]] = {}
         # Context dedup: track message_ids already injected as context per chat_id
         self._context_injected: Dict[str, Set[str]] = {}
+        # Known bot open_id → name from config.yaml (no API call needed)
+        _raw_known = (config.extra or {}).get("known_bot_names", {})
+        self._known_bot_names: Dict[str, str] = dict(_raw_known) if isinstance(_raw_known, dict) else {}
 
 
     @staticmethod
@@ -4004,14 +4007,7 @@ class FeishuAdapter(BasePlatformAdapter):
         return None
 
     async def _get_display_name(self, open_id: str) -> str:
-        """Return a human-readable name for an open_id (bot or human).
-
-        Cache hit → return immediately.
-        Cache miss → try bot API → fallback.
-        The cache is pre-warmed from group member list API before this is called,
-        so cache hits cover all group members (bots + humans) with no contact scope.
-        Successful API hits are cached with TTL; fallbacks are not.
-        """
+        """Return a human-readable name for an open_id (bot or human)."""
         if not open_id:
             return "Unknown"
         now = time.time()
@@ -4024,20 +4020,11 @@ class FeishuAdapter(BasePlatformAdapter):
                 return name or open_id
             self._sender_name_cache.pop(open_id, None)
 
-        # Try bot API
-        try:
-            names = await self._fetch_bot_names([open_id])
-            if names and open_id in names:
-                name = names[open_id].strip()
-                if name:
-                    self._sender_name_cache[open_id] = (name, now + _FEISHU_SENDER_NAME_TTL_SECONDS)
-                    return name
-        except Exception as e1:
-            logger.error("[Feishu] Bot API name lookup failed for %s, err: %s", open_id, e1, exc_info=True)
-
-        # Fallback — don't cache; next turn will try API again
-        short_id = open_id[:8] if open_id else ""
-        return f"sender({short_id}...)"
+        # Check known_bot_names from config.yaml (no API, no scope needed)
+        name = self._known_bot_names.get(open_id)
+        if name:
+            return name
+        return open_id
 
     async def _fetch_bot_names(self, bot_ids: List[str]) -> Optional[Dict[str, str]]:
         if not self._client or not bot_ids:
