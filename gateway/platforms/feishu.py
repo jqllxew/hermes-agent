@@ -1478,6 +1478,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._bot_reply_targets: Dict[str, Dict[str, str]] = {}
         # Context dedup: track message_ids already injected as context per chat_id
         self._context_injected: Dict[str, Set[str]] = {}
+        # Last trigger message_id per chat_id — anchors subsequent context fetches
+        self._last_trigger_id: Dict[str, str] = {}
         # Known bot open_id → name from config.yaml (no API call needed)
         _raw_known = (config.extra or {}).get("known_bot_names", {})
         self._known_bot_names: Dict[str, str] = dict(_raw_known) if isinstance(_raw_known, dict) else {}
@@ -4096,13 +4098,13 @@ class FeishuAdapter(BasePlatformAdapter):
     async def _fetch_chat_context_sync(self, *, chat_id: str, sender_open_id: str = "", sender_name: str = "", trigger_message_id: str = "", trigger_text: str = "", trigger_sender_name: str = "") -> Optional[str]:
         """Fetch recent messages from a group chat as context for replies.
 
-        Self-anchoring: finds our newest own message in the fetched window and
-        only keeps messages newer than it — everything at or before it is
-        already in the session history.  Deduplicates across calls per chat_id.
+        Anchors on the LAST trigger message per chat_id — keeps it and
+        everything newer as dialogue since the previous @.  First call has
+        no anchor → keeps all 20 fetched.  Skips own messages and
+        deduplicates via message_id across calls.
 
-        If the trigger message (the one that @-mentioned us) is not in the
-        retained window, it is prepended so the agent always sees the message
-        that triggered it.
+        If the trigger message is not in the fetched window, all messages
+        are retained and the trigger is prepended from parameters.
 
         Returns a string like:
           好运宝宝: 帮我看看这个
@@ -4142,20 +4144,35 @@ class FeishuAdapter(BasePlatformAdapter):
             seen = self._context_injected.setdefault(chat_id, set())
             self_app_id = self._app_id or ""
 
-            # ── Self-anchoring ──────────────────────────────────────────
-            # Find our own newest message; everything at or before it is
-            # already in the session as our last assistant reply — skip it.
+            # ── Last-trigger anchoring ───────────────────────────────────
+            # Priority chain:
+            # 1. last_trigger_id → cut there (keep trigger + newer)
+            # 2. No last_trigger → self-anchor (find own newest msg)
+            # 3. Neither found → keep all 20
             # items are newest-first (ByCreateTimeDesc).
             snip_at = len(items)  # default: take all
-            for i, msg in enumerate(items):
-                s = msg.get("sender") or {}
-                if s.get("sender_type") == "app" and s.get("id", "") == self_app_id:
-                    snip_at = i  # cut here: only items BEFORE this index are newer
-                    break
+            last_trigger = self._last_trigger_id.get(chat_id, "")
+            if last_trigger:
+                for i, msg in enumerate(items):
+                    if str(msg.get("message_id", "")) == last_trigger:
+                        snip_at = i + 1  # keep last-trigger + everything newer
+                        logger.info("[Feishu] context anchor: last_trigger found at pos=%d", i)
+                        break
+                else:
+                    logger.warning("[Feishu] context anchor: last_trigger not in window")
+            else:  # 没有 last_trigger 则降级为 自己消息锚定
+                for i, msg in enumerate(items):
+                    s = msg.get("sender") or {}
+                    if s.get("sender_type") == "app" and s.get("id", "") == self_app_id:
+                        snip_at = i  # cut at own newest message
+                        logger.info("[Feishu] context anchor: self-anchor fallback at pos=%d", i)
+                        break
+                else:
+                    logger.warning("[Feishu] context anchor: self-anchor fallback not found, keeping all")
 
-            recent_items = items[:snip_at]  # newest-first, all newer than our last msg
+            recent_items = items[:snip_at]
 
-            # Pre-fill name cache from chat member list (one API call, covers all humans + bots)
+            # Pre-fill name cache from chat member list (one API call, covers all humans)
             await self._populate_chat_member_names(chat_id)
 
             lines = []
@@ -4167,15 +4184,19 @@ class FeishuAdapter(BasePlatformAdapter):
                 if msg_id_val and msg_id_val in seen:
                     continue
 
-                # Skip trigger message — it appears below the --- separator
-                if trigger_message_id and msg_id_val == trigger_message_id:
+                # Skip trigger message — it will be replayed below
+                if trigger_message_id and str(msg_id_val) == str(trigger_message_id):
                     trigger_found = True
                     continue
 
                 sender = msg.get("sender") or {}
                 sender_id_val = sender.get("id", "")
+                sender_type = sender.get("sender_type", "")
+                # Skip own messages — already in session history
+                if sender_type == "app" and sender_id_val == self_app_id:
+                    continue
                 mentions = msg.get("mentions") or []
-                # Resolve name: cache → mentions → API → fallback
+                # Resolve name: cache → mentions → API (known_bot_names → bot API) → fallback
                 name = self._get_cached_sender_name(sender_id_val) or ""
                 if not name:
                     for m in mentions:
@@ -4201,18 +4222,22 @@ class FeishuAdapter(BasePlatformAdapter):
             # Anchor: if trigger message wasn't in the 20 fetched, prepend it
             if trigger_message_id and not trigger_found and trigger_message_id not in seen:
                 lines.insert(0, f"{trigger_sender_name}: {trigger_text}")
-                if trigger_message_id:
-                    seen.add(trigger_message_id)
+                # if trigger_message_id:
+                seen.add(trigger_message_id)
 
             # Cap seen set per chat_id to prevent unbounded memory growth
             if len(seen) > 200:
                 self._context_injected[chat_id] = set(sorted(seen)[-100:])
 
+            # Record this trigger as the anchor for the next call
+            if trigger_message_id:
+                self._last_trigger_id[chat_id] = trigger_message_id
+
             if not lines:
                 return None
             return "\n".join(lines)
-        except Exception:
-            logger.debug("[Feishu] _fetch_chat_context_sync failed", exc_info=True)
+        except Exception as e:
+            logger.error("[Feishu] _fetch_chat_context_sync failed, err: %s", e, exc_info=True)
             return None
 
     async def _populate_chat_member_names(self, chat_id: str) -> None:
