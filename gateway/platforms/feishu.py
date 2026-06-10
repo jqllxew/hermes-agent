@@ -3208,8 +3208,10 @@ class FeishuAdapter(BasePlatformAdapter):
                 }
                 logger.info("[Feishu] Bot reply target stored: msg_id=%s name=%s open_id=%s",
                             message_id, sender_name, sender_open_id)
-            # Fetch recent messages as context
-            chat_context = await self._fetch_chat_context_sync(chat_id=chat_id)
+            # Fetch recent messages as context (only from the bot who @-mentioned us)
+            chat_context = await self._fetch_chat_context_sync(
+                chat_id=chat_id, sender_open_id=sender_open_id, sender_name=sender_name
+            )
             if chat_context:
                 text = f"[群聊上下文]\n{chat_context}\n---\n{text}"
         source = self.build_source(
@@ -4116,16 +4118,19 @@ class FeishuAdapter(BasePlatformAdapter):
             return None
 
     # Maximum number of recent messages to fetch for bot-to-bot chat context.
-    _CHAT_CONTEXT_LIMIT = 7
+    _CHAT_CONTEXT_LIMIT = 20  # fetch more since we filter by sender
     # Known bot open_id → display name mapping (used when API name resolution fails).
     _KNOWN_BOT_NAMES: Dict[str, str] = {}
 
-    async def _fetch_chat_context_sync(self, *, chat_id: str) -> Optional[str]:
+    async def _fetch_chat_context_sync(self, *, chat_id: str, sender_open_id: str = "", sender_name: str = "") -> Optional[str]:
         """Fetch recent messages from a group chat as context for bot-to-bot replies.
 
+        Excludes own messages; keeps everything else (other bots, users).
+        This gives the agent the full picture of the conversation thread.
+
         Returns a string like:
-          豆包包3号: 2姐帮我看看这个
-          好运宝宝: 这是什么？
+          好运宝宝: 帮我看看这个
+          豆包包3号: 2姐快来
         or None on failure.
         """
         if "BaseRequest" not in globals():
@@ -4161,21 +4166,23 @@ class FeishuAdapter(BasePlatformAdapter):
             self_app_id = self._app_id or ""
             for msg in reversed(items):  # oldest first
                 sender = msg.get("sender") or {}
-                sender_app_id = sender.get("id", "")
+                sender_id_val = sender.get("id", "")
                 sender_type = sender.get("sender_type", "")
                 # Skip own messages
-                if sender_type == "app" and sender_app_id == self_app_id:
+                if sender_type == "app" and sender_id_val == self_app_id:
                     continue
-                sender_name = sender.get("sender_id", {}).get("name", "") if hasattr(sender, 'get') else ""
-                # Try to extract name from mentions or sender info
-                name = ""
                 mentions = msg.get("mentions") or []
-                for m in mentions:
-                    if m.get("id") == sender_app_id:
-                        name = m.get("name", "")
-                        break
-                if not name:
-                    name = sender_type
+                # Resolve name: known_bot_names > mentions > sender_type fallback
+                name = ""
+                if sender_id_val in self._known_bot_names:
+                    name = self._known_bot_names[sender_id_val]
+                else:
+                    for m in mentions:
+                        if m.get("id") == sender_id_val:
+                            name = m.get("name", "")
+                            break
+                    if not name:
+                        name = sender_type or "Unknown"
                 body = msg.get("body") or {}
                 raw_content = body.get("content", "")
                 msg_type = msg.get("msg_type", "text")
