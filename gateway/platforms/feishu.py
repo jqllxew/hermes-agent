@@ -1840,11 +1840,13 @@ class FeishuAdapter(BasePlatformAdapter):
             if target:
                 open_id = target.get("open_id")
                 name = target.get("name")
-                if open_id and "<at user_id=" not in all_text:
+                # Already mentioned: either structured <at user_id=...> or plain @name
+                already_mentioned = "<at user_id=" in all_text or (name and f"@{name}" in all_text)
+                if open_id and not already_mentioned:
                     at_text = f'<at user_id="{open_id}">@{name}</at> 👋'
                     at_payload = json.dumps({"text": at_text}, ensure_ascii=False)
-                    logger.info("[Feishu] Auto @mention: reply_to=%s target=%s has_at=%s",
-                                reply_to, name, "<at user_id=" in all_text)
+                    logger.info("[Feishu] Auto @mention: reply_to=%s target=%s mentioned=%s",
+                                reply_to, name, already_mentioned)
                     try:
                         response = await self._feishu_send_with_retry(
                             chat_id=chat_id,
@@ -1860,8 +1862,8 @@ class FeishuAdapter(BasePlatformAdapter):
                     except Exception:
                         logger.warning("[Feishu] Auto @mention failed for %s", name, exc_info=True)
                 else:
-                    logger.info("[Feishu] Auto @mention SKIP: open_id=%s has_at=%s reply_to=%s keys=%s",
-                                bool(open_id), "<at user_id=" in all_text, reply_to, list(self._bot_reply_targets.keys()))
+                    logger.info("[Feishu] Auto @mention SKIP: open_id=%s mentioned=%s reply_to=%s keys=%s",
+                                bool(open_id), already_mentioned, reply_to, list(self._bot_reply_targets.keys()))
             else:
                 if reply_to:
                     logger.info("[Feishu] Auto @mention NO TARGET: reply_to=%s keys=%s",
