@@ -4206,17 +4206,22 @@ class FeishuAdapter(BasePlatformAdapter):
                 sender_id_val = sender.get("id", "")
                 sender_type = sender.get("sender_type", "")
                 mentions = msg.get("mentions") or []
-                # Resolve name: known_bot_names > mentions > sender_type fallback
+                # Resolve name: known_bot_names > sender_name_cache > mentions > truncated open_id fallback
                 name = ""
                 if sender_id_val in self._known_bot_names:
                     name = self._known_bot_names[sender_id_val]
                 else:
-                    for m in mentions:
-                        if m.get("id") == sender_id_val:
-                            name = m.get("name", "")
-                            break
-                    if not name:
-                        name = sender_type or "Unknown"
+                    cached = self._get_cached_sender_name(sender_id_val)
+                    if cached:
+                        name = cached
+                    else:
+                        for m in mentions:
+                            if m.get("id") == sender_id_val:
+                                name = m.get("name", "")
+                                break
+                        if not name:
+                            short_id = sender_id_val[:8] if sender_id_val else ""
+                            name = f"{sender_type or 'Unknown'}({short_id}...)" if short_id else (sender_type or "Unknown")
                 body = msg.get("body") or {}
                 raw_content = body.get("content", "")
                 msg_type = msg.get("msg_type", "text")
@@ -4236,6 +4241,13 @@ class FeishuAdapter(BasePlatformAdapter):
                 lines.insert(0, f"{trigger_sender_name}: {trigger_text}")
                 if trigger_message_id:
                     seen.add(trigger_message_id)
+
+            # Dedup: if the last context line is the same as the trigger message
+            # (it's already below the --- separator), remove it from context.
+            if trigger_text and lines:
+                trigger_line = f"{trigger_sender_name}: {trigger_text}"
+                if lines[-1] == trigger_line:
+                    lines.pop()
 
             # Cap seen set per chat_id to prevent unbounded memory growth
             if len(seen) > 200:
