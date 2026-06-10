@@ -3200,8 +3200,8 @@ class FeishuAdapter(BasePlatformAdapter):
         chat_info = await self.get_chat_info(chat_id)
         sender_profile = await self._resolve_sender_profile(sender_id, is_bot=is_bot)
 
-        # Bot-to-bot: track reply target for auto-@mention and inject chat context
-        if is_bot and chat_type == "group":
+        # Bot-to-bot or human-to-bot: track reply target for auto-@mention and inject chat context
+        if chat_type == "group":
             sender_open_id = getattr(sender_id, "open_id", None) or None
             sender_name = self._known_bot_names.get(sender_open_id) or sender_profile.get("user_name") or "Bot"
             if sender_open_id:
