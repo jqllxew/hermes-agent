@@ -4041,8 +4041,14 @@ class FeishuAdapter(BasePlatformAdapter):
                 if name and isinstance(name, str):
                     name = name.strip()
                     if name:
+                        logger.info("[Feishu] _get_display_name: user API returned name=%r for %s", name, open_id)
                         self._sender_name_cache[open_id] = (name, now + _FEISHU_SENDER_NAME_TTL_SECONDS)
                         return name
+                logger.warning("[Feishu] _get_display_name: user API success but no name field for %s", open_id)
+            else:
+                code = getattr(response, "code", None) if response else None
+                msg = getattr(response, "msg", "") if response else "no response"
+                logger.warning("[Feishu] _get_display_name: user API failed for %s code=%s msg=%s", open_id, code, msg)
         except Exception:
             logger.debug("[Feishu] User API name lookup failed for %s", open_id, exc_info=True)
 
