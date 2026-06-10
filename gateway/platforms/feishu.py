@@ -3197,6 +3197,10 @@ class FeishuAdapter(BasePlatformAdapter):
 
         chat_id = getattr(message, "chat_id", "") or ""
         chat_info = await self.get_chat_info(chat_id)
+        # Pre-warm the name cache from group member list so _get_display_name
+        # hits cache on the very first call — no contact API scope needed.
+        if chat_type == "group" and chat_id:
+            await self._populate_chat_member_names(chat_id)
         sender_profile = await self._resolve_sender_profile(sender_id)
 
         # Bot-to-bot: only track reply target for bots so auto-@ fires for them.
@@ -4003,9 +4007,10 @@ class FeishuAdapter(BasePlatformAdapter):
         """Return a human-readable name for an open_id (bot or human).
 
         Cache hit → return immediately.
-        Cache miss → try contact API (users) → try bot API → fallback.
+        Cache miss → try bot API → fallback.
+        The cache is pre-warmed from group member list API before this is called,
+        so cache hits cover all group members (bots + humans) with no contact scope.
         Successful API hits are cached with TTL; fallbacks are not.
-        No ``is_bot`` needed — the method discovers the type by trying both APIs.
         """
         if not open_id:
             return "Unknown"
@@ -4019,39 +4024,6 @@ class FeishuAdapter(BasePlatformAdapter):
                 return name or open_id
             self._sender_name_cache.pop(open_id, None)
 
-        # Try user API first (cheaper, broader)
-        try:
-            from lark_oapi.api.contact.v3 import GetUserRequest  # lazy import
-            if open_id.startswith("ou_"):
-                id_type = "open_id"
-            elif open_id.startswith("on_"):
-                id_type = "union_id"
-            else:
-                id_type = "user_id"
-            request = GetUserRequest.builder().user_id(open_id).user_id_type(id_type).build()
-            response = await asyncio.to_thread(self._client.contact.v3.user.get, request)
-            if response and response.success():
-                user = getattr(getattr(response, "data", None), "user", None)
-                name = (
-                    getattr(user, "name", None)
-                    or getattr(user, "display_name", None)
-                    or getattr(user, "nickname", None)
-                    or getattr(user, "en_name", None)
-                )
-                if name and isinstance(name, str):
-                    name = name.strip()
-                    if name:
-                        logger.info("[Feishu] _get_display_name: user API returned name=%r for %s", name, open_id)
-                        self._sender_name_cache[open_id] = (name, now + _FEISHU_SENDER_NAME_TTL_SECONDS)
-                        return name
-                logger.warning("[Feishu] _get_display_name: user API success but no name field for %s", open_id)
-            else:
-                code = getattr(response, "code", None) if response else None
-                msg = getattr(response, "msg", "") if response else "no response"
-                logger.warning("[Feishu] _get_display_name: user API failed for %s code=%s msg=%s", open_id, code, msg)
-        except Exception:
-            logger.debug("[Feishu] User API name lookup failed for %s", open_id, exc_info=True)
-
         # Try bot API
         try:
             names = await self._fetch_bot_names([open_id])
@@ -4060,8 +4032,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 if name:
                     self._sender_name_cache[open_id] = (name, now + _FEISHU_SENDER_NAME_TTL_SECONDS)
                     return name
-        except Exception:
-            logger.debug("[Feishu] Bot API name lookup failed for %s", open_id, exc_info=True)
+        except Exception as e1:
+            logger.error("[Feishu] Bot API name lookup failed for %s, err: %s", open_id, e1, exc_info=True)
 
         # Fallback — don't cache; next turn will try API again
         short_id = open_id[:8] if open_id else ""
