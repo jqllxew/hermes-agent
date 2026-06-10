@@ -4196,6 +4196,9 @@ class FeishuAdapter(BasePlatformAdapter):
 
             recent_items = items[:snip_at]  # newest-first, all newer than our last msg
 
+            # Pre-fill name cache from chat member list (one API call, covers all humans + bots)
+            await self._populate_chat_member_names(chat_id)
+
             lines = []
             trigger_found = False
 
@@ -4252,6 +4255,43 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("[Feishu] _fetch_chat_context_sync failed", exc_info=True)
             return None
+
+    async def _populate_chat_member_names(self, chat_id: str) -> None:
+        """Pre-fill _sender_name_cache from chat member list API.
+
+        One API call per context-fetch covers all humans and bots in the chat.
+        Subsequent _get_display_name calls hit cache immediately.
+        """
+        if not chat_id or "BaseRequest" not in globals():
+            return
+        try:
+            req = (
+                BaseRequest.builder()
+                .http_method(HttpMethod.GET)
+                .uri("/open-apis/im/v1/chats/" + chat_id + "/members")
+                .queries([("member_id_type", "open_id"), ("page_size", "100")])
+                .token_types({AccessTokenType.TENANT})
+                .build()
+            )
+            resp = await asyncio.to_thread(self._client.request, req)
+            content = getattr(getattr(resp, "raw", None), "content", None)
+            if not content:
+                return
+            payload = json.loads(content)
+            if payload.get("code") != 0:
+                logger.debug("[Feishu] _populate_chat_member_names: API error code=%s", payload.get("code"))
+                return
+            items = (payload.get("data") or {}).get("items") or []
+            now = time.time()
+            for member in items:
+                open_id = member.get("member_id", "")
+                name = member.get("name", "")
+                if open_id and name and open_id not in self._sender_name_cache:
+                    self._sender_name_cache[open_id] = (name, now + _FEISHU_SENDER_NAME_TTL_SECONDS)
+            if items:
+                logger.info("[Feishu] _populate_chat_member_names: cached %d members for %s", len(items), chat_id[:12])
+        except Exception:
+            logger.debug("[Feishu] _populate_chat_member_names failed for %s", chat_id, exc_info=True)
 
     def _extract_text_from_raw_content(
         self,
