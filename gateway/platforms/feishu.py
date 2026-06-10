@@ -1843,7 +1843,7 @@ class FeishuAdapter(BasePlatformAdapter):
             if target:
                 open_id = target.get("open_id")
                 name = target.get("name")
-                if open_id and "<at user_id=" not in all_text:
+                if open_id and f'<at user_id="{open_id}"' not in all_text:
                     at_text = f'<at user_id="{open_id}">@{name}</at> 👋'
                     at_payload = json.dumps({"text": at_text}, ensure_ascii=False)
                     logger.info("[Feishu] Auto @mention: reply_to=%s target=%s has_at=%s",
