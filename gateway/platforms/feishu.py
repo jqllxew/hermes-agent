@@ -1836,7 +1836,10 @@ class FeishuAdapter(BasePlatformAdapter):
 
             # Bot-to-bot auto @mention: if replying to a bot and no <at> tag in
             # any chunk, append a trailing @mention so the target bot receives it.
-            target = self._bot_reply_targets.pop(reply_to, None) if reply_to else None
+            # Skip for gateway system messages (busy-ack, queue, subagent) — they
+            # are not agent-authored replies and auto-@ on them triggers ping-pong.
+            is_system_msg = all_text.startswith(("⚡", "⏳"))
+            target = self._bot_reply_targets.pop(reply_to, None) if reply_to and not is_system_msg else None
             if target:
                 open_id = target.get("open_id")
                 name = target.get("name")
