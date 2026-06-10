@@ -3197,7 +3197,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
         chat_id = getattr(message, "chat_id", "") or ""
         chat_info = await self.get_chat_info(chat_id)
-        sender_profile = await self._resolve_sender_profile(sender_id, is_bot=is_bot)
+        sender_profile = await self._resolve_sender_profile(sender_id)
 
         # Bot-to-bot: only track reply target for bots so auto-@ fires for them.
         # Human-to-bot and bot-to-bot: inject chat context (deduped, anchored).
@@ -3962,8 +3962,6 @@ class FeishuAdapter(BasePlatformAdapter):
     async def _resolve_sender_profile(
         self,
         sender_id: Any,
-        *,
-        is_bot: bool = False,
     ) -> Dict[str, Optional[str]]:
         """Map Feishu's three-tier user IDs onto Hermes' SessionSource fields.
 
@@ -3981,11 +3979,7 @@ class FeishuAdapter(BasePlatformAdapter):
         union_id = getattr(sender_id, "union_id", None) or None
         # Prefer tenant-scoped user_id; fall back to app-scoped open_id.
         primary_id = user_id or open_id
-        # bot/v3/bots/basic_batch only accepts open_id.
-        name_lookup_id = open_id if is_bot else (primary_id or union_id)
-        display_name = await self._resolve_sender_name_from_api(
-            name_lookup_id, is_bot=is_bot,
-        )
+        display_name = await self._get_display_name(open_id)
         return {
             "user_id": primary_id,
             "user_name": display_name,
@@ -4005,60 +3999,67 @@ class FeishuAdapter(BasePlatformAdapter):
         self._sender_name_cache.pop(sender_id, None)
         return None
 
-    async def _resolve_sender_name_from_api(
-        self,
-        sender_id: Optional[str],
-        *,
-        is_bot: bool = False,
-    ) -> Optional[str]:
-        """Bots divert to bot/basic_batch — contact API doesn't return bot names.
-        Failures are silent so the pipeline never blocks on name resolution.
+    async def _get_display_name(self, open_id: str) -> str:
+        """Return a human-readable name for an open_id (bot or human).
+
+        Cache hit → return immediately.
+        Cache miss → try contact API (users) → try bot API → fallback.
+        Successful API hits are cached with TTL; fallbacks are not.
+        No ``is_bot`` needed — the method discovers the type by trying both APIs.
         """
-        if not sender_id or not self._client:
-            return None
-        trimmed = sender_id.strip()
-        if not trimmed:
-            return None
+        if not open_id:
+            return "Unknown"
         now = time.time()
-        cached_name = self._get_cached_sender_name(trimmed)
-        if cached_name is not None:
-            return cached_name or None  # "" cached means "known nameless"
-        if is_bot:
-            names = await self._fetch_bot_names([trimmed])
-            if names is None:
-                return None
-            expire_at = now + _FEISHU_SENDER_NAME_TTL_SECONDS
-            for oid, name in names.items():
-                self._sender_name_cache[oid] = (name, expire_at)
-            hit = self._sender_name_cache.get(trimmed)
-            return (hit[0] or None) if hit else None
+
+        # Check cache
+        cached = self._sender_name_cache.get(open_id)
+        if cached is not None:
+            name, expire_at = cached
+            if now < expire_at:
+                return name or open_id
+            self._sender_name_cache.pop(open_id, None)
+
+        # Try user API first (cheaper, broader)
         try:
             from lark_oapi.api.contact.v3 import GetUserRequest  # lazy import
-            if trimmed.startswith("ou_"):
+            if open_id.startswith("ou_"):
                 id_type = "open_id"
-            elif trimmed.startswith("on_"):
+            elif open_id.startswith("on_"):
                 id_type = "union_id"
             else:
                 id_type = "user_id"
-            request = GetUserRequest.builder().user_id(trimmed).user_id_type(id_type).build()
+            request = GetUserRequest.builder().user_id(open_id).user_id_type(id_type).build()
             response = await asyncio.to_thread(self._client.contact.v3.user.get, request)
-            if not response or not response.success():
-                return None
-            user = getattr(getattr(response, "data", None), "user", None)
-            name = (
-                getattr(user, "name", None)
-                or getattr(user, "display_name", None)
-                or getattr(user, "nickname", None)
-                or getattr(user, "en_name", None)
-            )
-            if name and isinstance(name, str):
-                name = name.strip()
+            if response and response.success():
+                user = getattr(getattr(response, "data", None), "user", None)
+                name = (
+                    getattr(user, "name", None)
+                    or getattr(user, "display_name", None)
+                    or getattr(user, "nickname", None)
+                    or getattr(user, "en_name", None)
+                )
+                if name and isinstance(name, str):
+                    name = name.strip()
+                    if name:
+                        self._sender_name_cache[open_id] = (name, now + _FEISHU_SENDER_NAME_TTL_SECONDS)
+                        return name
+        except Exception:
+            logger.debug("[Feishu] User API name lookup failed for %s", open_id, exc_info=True)
+
+        # Try bot API
+        try:
+            names = await self._fetch_bot_names([open_id])
+            if names and open_id in names:
+                name = names[open_id].strip()
                 if name:
-                    self._sender_name_cache[trimmed] = (name, now + _FEISHU_SENDER_NAME_TTL_SECONDS)
+                    self._sender_name_cache[open_id] = (name, now + _FEISHU_SENDER_NAME_TTL_SECONDS)
                     return name
         except Exception:
-            logger.debug("[Feishu] Failed to resolve sender name for %s", sender_id, exc_info=True)
-        return None
+            logger.debug("[Feishu] Bot API name lookup failed for %s", open_id, exc_info=True)
+
+        # Fallback — don't cache; next turn will try API again
+        short_id = open_id[:8] if open_id else ""
+        return f"sender({short_id}...)"
 
     async def _fetch_bot_names(self, bot_ids: List[str]) -> Optional[Dict[str, str]]:
         if not self._client or not bot_ids:
@@ -4193,17 +4194,20 @@ class FeishuAdapter(BasePlatformAdapter):
             trigger_found = False
 
             for msg in reversed(recent_items):  # oldest first
-                msg_id = msg.get("message_id", "")
+                msg_id_val = msg.get("message_id", "")
                 # Skip already-injected messages
-                if msg_id and msg_id in seen:
+                if msg_id_val and msg_id_val in seen:
                     continue
-                if msg_id and msg_id == trigger_message_id:
+
+                # Skip trigger message — it appears below the --- separator
+                if trigger_message_id and msg_id_val == trigger_message_id:
                     trigger_found = True
+                    continue
+
                 sender = msg.get("sender") or {}
                 sender_id_val = sender.get("id", "")
-                sender_type = sender.get("sender_type", "")
                 mentions = msg.get("mentions") or []
-                # Resolve name: sender_name_cache > mentions > truncated open_id fallback
+                # Resolve name: cache → mentions → API → fallback
                 name = self._get_cached_sender_name(sender_id_val) or ""
                 if not name:
                     for m in mentions:
@@ -4211,8 +4215,7 @@ class FeishuAdapter(BasePlatformAdapter):
                             name = m.get("name", "")
                             break
                     if not name:
-                        short_id = sender_id_val[:8] if sender_id_val else ""
-                        name = f"{sender_type or 'Unknown'}({short_id}...)" if short_id else (sender_type or "Unknown")
+                        name = await self._get_display_name(sender_id_val)
                 body = msg.get("body") or {}
                 raw_content = body.get("content", "")
                 msg_type = msg.get("msg_type", "text")
@@ -4224,21 +4227,14 @@ class FeishuAdapter(BasePlatformAdapter):
                 if not text:
                     continue
                 lines.append(f"{name}: {text}")
-                if msg_id:
-                    seen.add(msg_id)
+                if msg_id_val:
+                    seen.add(msg_id_val)
 
             # Anchor: if trigger message wasn't in the 20 fetched, prepend it
             if trigger_message_id and not trigger_found and trigger_message_id not in seen:
                 lines.insert(0, f"{trigger_sender_name}: {trigger_text}")
                 if trigger_message_id:
                     seen.add(trigger_message_id)
-
-            # Dedup: if the last context line is the same as the trigger message
-            # (it's already below the --- separator), remove it from context.
-            if trigger_text and lines:
-                trigger_line = f"{trigger_sender_name}: {trigger_text}"
-                if lines[-1] == trigger_line:
-                    lines.pop()
 
             # Cap seen set per chat_id to prevent unbounded memory growth
             if len(seen) > 200:
