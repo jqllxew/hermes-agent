@@ -1478,10 +1478,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._bot_reply_targets: Dict[str, Dict[str, str]] = {}
         # Context dedup: track message_ids already injected as context per chat_id
         self._context_injected: Dict[str, Set[str]] = {}
-        # Known bot open_id → name mapping from config.yaml feishu.known_bot_names
-        _raw_known = (config.extra or {}).get("known_bot_names", {})
-        self._known_bot_names: Dict[str, str] = dict(_raw_known) if isinstance(_raw_known, dict) else {}
-        logger.info(f"[Feishu] _known_bot_names loaded: {self._known_bot_names}")
+
 
     @staticmethod
     def _load_settings(extra: Dict[str, Any]) -> FeishuAdapterSettings:
@@ -3206,7 +3203,7 @@ class FeishuAdapter(BasePlatformAdapter):
         # Human-to-bot and bot-to-bot: inject chat context (deduped, anchored).
         if chat_type == "group":
             sender_open_id = getattr(sender_id, "open_id", None) or None
-            sender_name = self._known_bot_names.get(sender_open_id) or sender_profile.get("user_name") or "Bot"
+            sender_name = sender_profile.get("user_name") or "Bot"
             if is_bot and sender_open_id:
                 self._bot_reply_targets[message_id] = {
                     "open_id": sender_open_id,
@@ -4206,22 +4203,16 @@ class FeishuAdapter(BasePlatformAdapter):
                 sender_id_val = sender.get("id", "")
                 sender_type = sender.get("sender_type", "")
                 mentions = msg.get("mentions") or []
-                # Resolve name: known_bot_names > sender_name_cache > mentions > truncated open_id fallback
-                name = ""
-                if sender_id_val in self._known_bot_names:
-                    name = self._known_bot_names[sender_id_val]
-                else:
-                    cached = self._get_cached_sender_name(sender_id_val)
-                    if cached:
-                        name = cached
-                    else:
-                        for m in mentions:
-                            if m.get("id") == sender_id_val:
-                                name = m.get("name", "")
-                                break
-                        if not name:
-                            short_id = sender_id_val[:8] if sender_id_val else ""
-                            name = f"{sender_type or 'Unknown'}({short_id}...)" if short_id else (sender_type or "Unknown")
+                # Resolve name: sender_name_cache > mentions > truncated open_id fallback
+                name = self._get_cached_sender_name(sender_id_val) or ""
+                if not name:
+                    for m in mentions:
+                        if m.get("id") == sender_id_val:
+                            name = m.get("name", "")
+                            break
+                    if not name:
+                        short_id = sender_id_val[:8] if sender_id_val else ""
+                        name = f"{sender_type or 'Unknown'}({short_id}...)" if short_id else (sender_type or "Unknown")
                 body = msg.get("body") or {}
                 raw_content = body.get("content", "")
                 msg_type = msg.get("msg_type", "text")
