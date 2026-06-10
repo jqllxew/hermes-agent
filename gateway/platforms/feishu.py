@@ -3201,29 +3201,19 @@ class FeishuAdapter(BasePlatformAdapter):
         if is_bot and chat_type == "group":
             sender_open_id = getattr(sender_id, "open_id", None) or None
             sender_name = self._known_bot_names.get(sender_open_id) or sender_profile.get("user_name") or "Bot"
-
-            # Detect auto @mention ping-pong: if the incoming message after
-            # stripping <at> tags is nearly empty (just emoji / whitespace),
-            # it's likely another bot's auto-@ delivery notification. Skip
-            # storing a reply target to avoid infinite ping-pong loops.
-            _bare_text = re.sub(r"<at[^>]*>[^<]*</at>", "", text or "").strip()
-            _bare_text = re.sub(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]", "", _bare_text).strip()
-            if not _bare_text or len(_bare_text) <= 2:
-                logger.info("[Feishu] Bot-to-bot mention ignored (empty after strip): msg_id=%s sender=%s", message_id, sender_name)
-            else:
-                if sender_open_id:
-                    self._bot_reply_targets[message_id] = {
-                        "open_id": sender_open_id,
-                        "name": sender_name,
-                    }
-                    logger.info("[Feishu] Bot reply target stored: msg_id=%s name=%s open_id=%s",
-                                message_id, sender_name, sender_open_id)
-                # Fetch recent messages as context
-                chat_context = await self._fetch_chat_context_sync(
-                    chat_id=chat_id, sender_open_id=sender_open_id, sender_name=sender_name
-                )
-                if chat_context:
-                    text = f"[群聊上下文]\n{chat_context}\n---\n{text}"
+            if sender_open_id:
+                self._bot_reply_targets[message_id] = {
+                    "open_id": sender_open_id,
+                    "name": sender_name,
+                }
+                logger.info("[Feishu] Bot reply target stored: msg_id=%s name=%s open_id=%s",
+                            message_id, sender_name, sender_open_id)
+            # Fetch recent messages as context (only from the bot who @-mentioned us)
+            chat_context = await self._fetch_chat_context_sync(
+                chat_id=chat_id, sender_open_id=sender_open_id, sender_name=sender_name
+            )
+            if chat_context:
+                text = f"[群聊上下文]\n{chat_context}\n---\n{text}"
         source = self.build_source(
             chat_id=chat_id,
             chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
