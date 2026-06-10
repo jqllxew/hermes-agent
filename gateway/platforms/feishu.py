@@ -3221,7 +3221,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 trigger_message_id=message_id, trigger_text=text, trigger_sender_name=sender_name,
             )
             if chat_context:
-                text = f"[群聊上下文]\n{chat_context}\n---\n{text}"
+                text = f"{chat_context}\n---\n{text}"
         source = self.build_source(
             chat_id=chat_id,
             chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
@@ -4133,10 +4133,13 @@ class FeishuAdapter(BasePlatformAdapter):
     async def _fetch_chat_context_sync(self, *, chat_id: str, sender_open_id: str = "", sender_name: str = "", trigger_message_id: str = "", trigger_text: str = "", trigger_sender_name: str = "") -> Optional[str]:
         """Fetch recent messages from a group chat as context for replies.
 
-        Deduplicates across calls per chat_id so the same message is never
-        injected twice.  If the trigger message (the one that @-mentioned us)
-        is not in the fetched window, it is prepended so the agent always sees
-        the message that triggered it.
+        Self-anchoring: finds our newest own message in the fetched window and
+        only keeps messages newer than it — everything at or before it is
+        already in the session history.  Deduplicates across calls per chat_id.
+
+        If the trigger message (the one that @-mentioned us) is not in the
+        retained window, it is prepended so the agent always sees the message
+        that triggered it.
 
         Returns a string like:
           好运宝宝: 帮我看看这个
@@ -4174,10 +4177,25 @@ class FeishuAdapter(BasePlatformAdapter):
 
             # Dedup: skip messages already injected for this chat
             seen = self._context_injected.setdefault(chat_id, set())
+            self_app_id = self._app_id or ""
+
+            # ── Self-anchoring ──────────────────────────────────────────
+            # Find our own newest message; everything at or before it is
+            # already in the session as our last assistant reply — skip it.
+            # items are newest-first (ByCreateTimeDesc).
+            snip_at = len(items)  # default: take all
+            for i, msg in enumerate(items):
+                s = msg.get("sender") or {}
+                if s.get("sender_type") == "app" and s.get("id", "") == self_app_id:
+                    snip_at = i  # cut here: only items BEFORE this index are newer
+                    break
+
+            recent_items = items[:snip_at]  # newest-first, all newer than our last msg
+
             lines = []
             trigger_found = False
-            self_app_id = self._app_id or ""
-            for msg in reversed(items):  # oldest first
+
+            for msg in reversed(recent_items):  # oldest first
                 msg_id = msg.get("message_id", "")
                 # Skip already-injected messages
                 if msg_id and msg_id in seen:
@@ -4187,9 +4205,6 @@ class FeishuAdapter(BasePlatformAdapter):
                 sender = msg.get("sender") or {}
                 sender_id_val = sender.get("id", "")
                 sender_type = sender.get("sender_type", "")
-                # Skip own messages
-                if sender_type == "app" and sender_id_val == self_app_id:
-                    continue
                 mentions = msg.get("mentions") or []
                 # Resolve name: known_bot_names > mentions > sender_type fallback
                 name = ""
