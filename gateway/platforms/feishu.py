@@ -1476,6 +1476,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._load_seen_message_ids()
         # Bot-to-bot reply tracking: chat_id → {"open_id": ..., "name": ...}
         self._bot_reply_targets: Dict[str, Dict[str, str]] = {}
+        # Context dedup: track message_ids already injected as context per chat_id
+        self._context_injected: Dict[str, Set[str]] = {}
         # Known bot open_id → name mapping from config.yaml feishu.known_bot_names
         _raw_known = (config.extra or {}).get("known_bot_names", {})
         self._known_bot_names: Dict[str, str] = dict(_raw_known) if isinstance(_raw_known, dict) else {}
@@ -3211,9 +3213,11 @@ class FeishuAdapter(BasePlatformAdapter):
                 }
                 logger.info("[Feishu] Bot reply target stored: msg_id=%s name=%s open_id=%s",
                             message_id, sender_name, sender_open_id)
-            # Fetch recent messages as context (only from the bot who @-mentioned us)
+            # Fetch recent messages as context, deduplicated per chat;
+            # prepend the trigger message if it's not in the fetched window.
             chat_context = await self._fetch_chat_context_sync(
-                chat_id=chat_id, sender_open_id=sender_open_id, sender_name=sender_name
+                chat_id=chat_id, sender_open_id=sender_open_id, sender_name=sender_name,
+                trigger_message_id=message_id, trigger_text=text, trigger_sender_name=sender_name,
             )
             if chat_context:
                 text = f"[群聊上下文]\n{chat_context}\n---\n{text}"
@@ -4125,11 +4129,13 @@ class FeishuAdapter(BasePlatformAdapter):
     # Known bot open_id → display name mapping (used when API name resolution fails).
     _KNOWN_BOT_NAMES: Dict[str, str] = {}
 
-    async def _fetch_chat_context_sync(self, *, chat_id: str, sender_open_id: str = "", sender_name: str = "") -> Optional[str]:
-        """Fetch recent messages from a group chat as context for bot-to-bot replies.
+    async def _fetch_chat_context_sync(self, *, chat_id: str, sender_open_id: str = "", sender_name: str = "", trigger_message_id: str = "", trigger_text: str = "", trigger_sender_name: str = "") -> Optional[str]:
+        """Fetch recent messages from a group chat as context for replies.
 
-        Excludes own messages; keeps everything else (other bots, users).
-        This gives the agent the full picture of the conversation thread.
+        Deduplicates across calls per chat_id so the same message is never
+        injected twice.  If the trigger message (the one that @-mentioned us)
+        is not in the fetched window, it is prepended so the agent always sees
+        the message that triggered it.
 
         Returns a string like:
           好运宝宝: 帮我看看这个
@@ -4162,12 +4168,21 @@ class FeishuAdapter(BasePlatformAdapter):
                 logger.debug("[Feishu] _fetch_chat_context_sync: API error code=%s", payload.get("code"))
                 return None
             items = (payload.get("data") or {}).get("items") or []
-            if not items:
+            if not items and not trigger_text:
                 return None
 
+            # Dedup: skip messages already injected for this chat
+            seen = self._context_injected.setdefault(chat_id, set())
             lines = []
+            trigger_found = False
             self_app_id = self._app_id or ""
             for msg in reversed(items):  # oldest first
+                msg_id = msg.get("message_id", "")
+                # Skip already-injected messages
+                if msg_id and msg_id in seen:
+                    continue
+                if msg_id and msg_id == trigger_message_id:
+                    trigger_found = True
                 sender = msg.get("sender") or {}
                 sender_id_val = sender.get("id", "")
                 sender_type = sender.get("sender_type", "")
@@ -4197,6 +4212,18 @@ class FeishuAdapter(BasePlatformAdapter):
                 if not text:
                     continue
                 lines.append(f"{name}: {text}")
+                if msg_id:
+                    seen.add(msg_id)
+
+            # Anchor: if trigger message wasn't in the 20 fetched, prepend it
+            if trigger_message_id and not trigger_found and trigger_message_id not in seen:
+                lines.insert(0, f"{trigger_sender_name}: {trigger_text}")
+                if trigger_message_id:
+                    seen.add(trigger_message_id)
+
+            # Cap seen set per chat_id to prevent unbounded memory growth
+            if len(seen) > 200:
+                self._context_injected[chat_id] = set(sorted(seen)[-100:])
 
             if not lines:
                 return None
