@@ -4212,14 +4212,13 @@ class FeishuAdapter(BasePlatformAdapter):
             # Record this trigger as the anchor for the next call
             if trigger_message_id:
                 self._last_trigger_id[chat_id] = trigger_message_id
-
-            if not lines:
-                return None
-            all_lines_text = "\n".join(lines)
+            all_lines_text = "\n".join(lines) if lines else ""
             if trigger_line:
                 all_lines_text = f"{all_lines_text}\n----------------------\n{trigger_line}"
             else:
                 logger.warning("[feishu] Successfully made the call but the message is too old")
+            if not all_lines_text:
+                raise Exception("trigger_line and lines cannot both be empty")
             logger.info("[Feishu] DEBUG merged context+trigger (%d chars):\n%s", len(all_lines_text), all_lines_text)
             return all_lines_text
         except Exception as e:
