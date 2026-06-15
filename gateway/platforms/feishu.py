@@ -3222,12 +3222,8 @@ class FeishuAdapter(BasePlatformAdapter):
                             message_id, sender_name, sender_open_id)
             # Fetch recent messages as context, deduplicated per chat;
             # prepend the trigger message if it's not in the fetched window.
-            chat_context = await self._fetch_chat_context_sync(
-                chat_id=chat_id, sender_open_id=sender_open_id, sender_name=sender_name,
-                trigger_message_id=message_id, trigger_text=text, trigger_sender_name=sender_name,
-            )
-            if chat_context:
-                text = f"{chat_context}\n---\n{text}"
+            text = await self._fetch_chat_context_sync(chat_id=chat_id, trigger_message_id=message_id)
+
         source = self.build_source(
             chat_id=chat_id,
             chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
@@ -4095,17 +4091,8 @@ class FeishuAdapter(BasePlatformAdapter):
     # Known bot open_id → display name mapping (used when API name resolution fails).
     _KNOWN_BOT_NAMES: Dict[str, str] = {}
 
-    async def _fetch_chat_context_sync(self, *, chat_id: str, sender_open_id: str = "", sender_name: str = "", trigger_message_id: str = "", trigger_text: str = "", trigger_sender_name: str = "") -> Optional[str]:
+    async def _fetch_chat_context_sync(self, *, chat_id: str, trigger_message_id: str = "") -> Optional[str]:
         """Fetch recent messages from a group chat as context for replies.
-
-        Anchors on the LAST trigger message per chat_id — keeps it and
-        everything newer as dialogue since the previous @.  First call has
-        no anchor → keeps all 20 fetched.  Skips own messages and
-        deduplicates via message_id across calls.
-
-        If the trigger message is not in the fetched window, all messages
-        are retained and the trigger is prepended from parameters.
-
         Returns a string like:
           好运宝宝: 帮我看看这个
           豆包包3号: 2姐快来
@@ -4137,7 +4124,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 logger.debug("[Feishu] _fetch_chat_context_sync: API error code=%s", payload.get("code"))
                 return None
             items = (payload.get("data") or {}).get("items") or []
-            if not items and not trigger_text:
+            if not items:
                 return None
 
             # Dedup: skip messages already injected for this chat
@@ -4176,17 +4163,12 @@ class FeishuAdapter(BasePlatformAdapter):
             await self._populate_chat_member_names(chat_id)
 
             lines = []
-            trigger_found = False
+            trigger_line = None
 
-            for msg in reversed(recent_items):  # oldest first
+            for msg in reversed(recent_items):
                 msg_id_val = msg.get("message_id", "")
                 # Skip already-injected messages
                 if msg_id_val and msg_id_val in seen:
-                    continue
-
-                # Skip trigger message — it will be replayed below
-                if trigger_message_id and str(msg_id_val) == str(trigger_message_id):
-                    trigger_found = True
                     continue
 
                 sender = msg.get("sender") or {}
@@ -4196,6 +4178,16 @@ class FeishuAdapter(BasePlatformAdapter):
                 if sender_type == "app" and sender_id_val == self_app_id:
                     continue
                 mentions = msg.get("mentions") or []
+                body = msg.get("body") or {}
+                raw_content = body.get("content", "")
+                msg_type = msg.get("msg_type", "text")
+                text = self._extract_text_from_raw_content(
+                    msg_type=msg_type,
+                    raw_content=raw_content,
+                    mentions=mentions,
+                )
+                if not text or text == "👋":
+                    continue
                 # Resolve name: cache → mentions → API (known_bot_names → bot API) → fallback
                 name = self._get_cached_sender_name(sender_id_val) or ""
                 if not name:
@@ -4205,25 +4197,13 @@ class FeishuAdapter(BasePlatformAdapter):
                             break
                     if not name:
                         name = await self._get_display_name(sender_id_val)
-                body = msg.get("body") or {}
-                raw_content = body.get("content", "")
-                msg_type = msg.get("msg_type", "text")
-                text = self._extract_text_from_raw_content(
-                    msg_type=msg_type,
-                    raw_content=raw_content,
-                    mentions=mentions,
-                )
-                if not text:
-                    continue
-                lines.append(f"{name}: {text}")
+                _line = f"{name}: {text}"
                 if msg_id_val:
                     seen.add(msg_id_val)
-
-            # Anchor: if trigger message wasn't in the 20 fetched, prepend it
-            if trigger_message_id and not trigger_found and trigger_message_id not in seen:
-                lines.insert(0, f"{trigger_sender_name}: {trigger_text}")
-                # if trigger_message_id:
-                seen.add(trigger_message_id)
+                if msg_id_val != trigger_message_id:
+                    lines.append(_line)
+                else:
+                    trigger_line = _line
 
             # Cap seen set per chat_id to prevent unbounded memory growth
             if len(seen) > 200:
@@ -4235,7 +4215,13 @@ class FeishuAdapter(BasePlatformAdapter):
 
             if not lines:
                 return None
-            return "\n".join(lines)
+            all_lines_text = "\n".join(lines)
+            if trigger_line:
+                all_lines_text = f"{all_lines_text}\n----------------------\n{trigger_line}"
+            else:
+                logger.warning("[feishu] Successfully made the call but the message is too old")
+            logger.info("[Feishu] DEBUG merged context+trigger (%d chars):\n%s", len(all_lines_text), all_lines_text)
+            return all_lines_text
         except Exception as e:
             logger.error("[Feishu] _fetch_chat_context_sync failed, err: %s", e, exc_info=True)
             return None
