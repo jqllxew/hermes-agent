@@ -847,7 +847,7 @@ def normalize_feishu_message(
         )
         return FeishuNormalizedMessage(
             raw_type=normalized_type,
-            text_content=alt_text if alt_text != FALLBACK_IMAGE_TEXT else "",
+            text_content=alt_text if alt_text != FALLBACK_IMAGE_TEXT else f"[Image: {image_key}]",
             preferred_message_type="photo",
             image_keys=[image_key] if image_key else [],
             relation_kind="image",
@@ -4151,7 +4151,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 for i, msg in enumerate(items):
                     s = msg.get("sender") or {}
                     if s.get("sender_type") == "app" and s.get("id", "") == self_app_id:
-                        snip_at = i  # cut at own newest message
+                        snip_at = i + 1  # include own newest (cron may have posted from another session)
                         logger.info("[Feishu] context anchor: self-anchor fallback at pos=%d", i)
                         break
                 else:
@@ -4174,9 +4174,6 @@ class FeishuAdapter(BasePlatformAdapter):
                 sender = msg.get("sender") or {}
                 sender_id_val = sender.get("id", "")
                 sender_type = sender.get("sender_type", "")
-                # Skip own messages — already in session history
-                if sender_type == "app" and sender_id_val == self_app_id:
-                    continue
                 mentions = msg.get("mentions") or []
                 body = msg.get("body") or {}
                 raw_content = body.get("content", "")
@@ -4198,6 +4195,14 @@ class FeishuAdapter(BasePlatformAdapter):
                     if not name:
                         name = await self._get_display_name(sender_id_val)
                 _line = f"{name}: {text}"
+                # If msg has @mentions not shown in text, prepend them all
+                missing_ats = []
+                for m in mentions:
+                    m_name = m.get("name", "")
+                    if m_name and f"@{m_name}" not in text:
+                        missing_ats.append(f"@{m_name}")
+                if missing_ats:
+                    _line = f"{name}: {' '.join(missing_ats)} {text}"
                 if msg_id_val:
                     seen.add(msg_id_val)
                 if msg_id_val != trigger_message_id:
