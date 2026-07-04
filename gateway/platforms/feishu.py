@@ -4217,7 +4217,7 @@ class FeishuAdapter(BasePlatformAdapter):
             # Record this trigger as the anchor for the next call
             if trigger_message_id:
                 self._last_trigger_id[chat_id] = trigger_message_id
-            all_lines_text = "\n".join(lines) if lines else ""
+            all_lines_text = "\n\n\n".join(lines) if lines else ""
             if trigger_line:
                 all_lines_text = f"{all_lines_text}\n----------------------\n{trigger_line}"
             else:
