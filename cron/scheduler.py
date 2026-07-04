@@ -1030,7 +1030,14 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             )
         argv = [_bash, str(path)]
     else:
-        argv = [sys.executable, str(path)]
+        # Use python.exe (not pythonw.exe) on Windows — pythonw.exe is a
+        # GUI-subsystem executable that cannot access SSL/crypto APIs,
+        # causing any script with network I/O to crash silently and produce
+        # zero stdout. python.exe has full console subsystem support.
+        py_exe = sys.executable
+        if sys.platform == "win32" and os.path.basename(py_exe).lower() == "pythonw.exe":
+            py_exe = os.path.join(os.path.dirname(py_exe), "python.exe")
+        argv = [py_exe, str(path)]
 
     run_env = os.environ.copy()
     run_env["HERMES_HOME"] = str(_get_hermes_home())
@@ -1044,7 +1051,9 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         pass
 
     try:
-        popen_kwargs = {"creationflags": windows_hide_flags()} if sys.platform == "win32" else {}
+        # Don't use CREATE_NO_WINDOW — when the parent is pythonw.exe
+        # (GUI subsystem), that flag can prevent pipe creation, causing
+        # capture_output to silently return empty stdout.
         result = subprocess.run(
             argv,
             capture_output=True,
@@ -1052,7 +1061,6 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             timeout=script_timeout,
             cwd=str(path.parent),
             env=run_env,
-            **popen_kwargs,
         )
         stdout = (result.stdout or "").strip()
         stderr = (result.stderr or "").strip()
@@ -1202,11 +1210,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         "DELIVERY: Your final response will be automatically delivered "
         "to the user — do NOT use send_message or try to deliver "
         "the output yourself. Just produce your report/output as your "
-        "final response and the system handles the rest. "
-        "SILENT: If there is genuinely nothing new to report, respond "
-        "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
-        "Never combine [SILENT] with content — either report your "
-        "findings normally, or say [SILENT] and nothing more.]\n\n"
+        "final response and the system handles the rest.]\n\n"
     )
     prompt = cron_hint + prompt
     if skills is None:
