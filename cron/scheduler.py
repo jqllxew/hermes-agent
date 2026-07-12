@@ -1064,6 +1064,15 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         )
         stdout = (result.stdout or "").strip()
         stderr = (result.stderr or "").strip()
+        
+        logger.info(
+            "Script exec: argv=%s cwd=%s rc=%d stdout=%d stderr=%d",
+            argv, str(path.parent), result.returncode, len(stdout), len(stderr)
+        )
+        if stderr:
+            logger.info("Script stderr (first 300): %s", stderr[:300])
+        if not stdout:
+            logger.info("Script stdout EMPTY despite rc=%d", result.returncode)
 
         # Redact secrets from both stdout and stderr before any return path.
         try:
@@ -1137,6 +1146,9 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         else:
             success, script_output = _run_job_script(script_path)
         if success:
+            logger.info("Job '%s' script output: len=%d, first100=%s", 
+                        job.get("name", "?"),
+                        len(script_output or ""), (script_output or "")[:100])
             if script_output:
                 prompt = (
                     "## Script Output\n"
