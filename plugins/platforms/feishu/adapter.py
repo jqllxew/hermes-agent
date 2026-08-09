@@ -135,8 +135,15 @@ from gateway.status import acquire_scoped_lock, release_scoped_lock
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write, env_float, env_int
 
-from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
-from agent.secret_scope import get_secret as _scoped_get_secret
+try:
+    from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
+    from agent.secret_scope import get_secret as _scoped_get_secret
+except ImportError:
+    # Local branch doesn't have secret_scope yet — fall back to os.environ.
+    # Safe for single-profile deployments; the upgrade path adds proper scoping.
+    _UnscopedSecretError = Exception  # noqa: N816
+    def _scoped_get_secret(name, default=None):
+        return os.getenv(name, default)
 
 
 def _get_scoped_secret(name, default=None):
