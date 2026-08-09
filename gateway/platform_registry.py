@@ -58,6 +58,11 @@ class PlatformEntry:
     # fail at connect() time with a descriptive error.
     validate_config: Optional[Callable[[Any], bool]] = None
 
+    # Optional: actively install missing dependencies (called when check_fn
+    # returns False). Returns True when deps are now available, False when
+    # installation failed or was skipped. None = no auto-installer.
+    ensure_deps_fn: Optional[Callable[[], bool]] = None
+
     # Optional: given a PlatformConfig, is the platform connected/enabled?
     # Used by ``GatewayConfig.get_connected_platforms()`` and setup UI status.
     # If None, falls back to ``validate_config`` or ``check_fn``.
