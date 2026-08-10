@@ -3811,11 +3811,13 @@ class FeishuAdapter(BasePlatformAdapter):
         """Return the session-scoped key used for Feishu text aggregation."""
         from gateway.session import build_session_key
 
+        # Local build_session_key predates the upstream `profile` field on
+        # SessionSource — getattr-guard so the plugin adapter stays compatible
+        # with the local session module.
         return build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-            profile=event.source.profile,
         )
 
     @staticmethod
