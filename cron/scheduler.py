@@ -1337,8 +1337,17 @@ def _scan_assembled_cron_prompt(assembled: str, job: dict, *, has_skills: bool =
     """
     from tools.cronjob_tools import _scan_cron_prompt, _scan_cron_skill_assembled
 
-    if has_skills:
-        # Skill content is install-time vetted by skills_guard.py. Invisible
+    # has_script_output: when a cron job has a script attached, the assembled
+    # prompt includes runtime script output (e.g. group chat context fetched
+    # by get_group_context.py).  That output is dynamic user content — not a
+    # user-supplied prompt — and must NOT be subjected to strict command-shape
+    # patterns like rm -rf / (which can appear in legitimate chat messages).
+    # Use the looser _scan_cron_skill_assembled for these jobs, same as skills.
+    has_script_output = bool(job.get("script"))
+
+    if has_skills or has_script_output:
+        # Skill / script content is vetted at install time by skills_guard.py
+        # (skills) or is runtime user-generated data (script output). Invisible
         # unicode is sanitized (not blocked) so a stray zero-width space in a
         # skill code example can't permanently kill the job; the cleaned
         # prompt is what actually runs.
