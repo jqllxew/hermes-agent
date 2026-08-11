@@ -895,7 +895,7 @@ def normalize_feishu_message(
         )
         return FeishuNormalizedMessage(
             raw_type=normalized_type,
-            text_content=alt_text if alt_text != FALLBACK_IMAGE_TEXT else "",
+            text_content=alt_text if alt_text != FALLBACK_IMAGE_TEXT else f"[Image: {image_key}]",
             preferred_message_type="photo",
             image_keys=[image_key] if image_key else [],
             relation_kind="image",
@@ -4463,11 +4463,20 @@ class FeishuAdapter(BasePlatformAdapter):
                 body = msg.get("body") or {}
                 raw_content = body.get("content", "")
                 msg_type = msg.get("msg_type", "text")
-                text = self._extract_text_from_raw_content(
-                    msg_type=msg_type,
-                    raw_content=raw_content,
-                    mentions=mentions,
-                )
+                if msg_type == "image":
+                    # 图片消息：附上 message_id，下载需要 message_id + image_key 两个参数
+                    try:
+                        _payload = json.loads(raw_content) if isinstance(raw_content, str) else {}
+                        _img_key = str(_payload.get("image_key", "") or "").strip()
+                    except Exception:
+                        _img_key = ""
+                    text = f"[Image: {msg_id_val}:{_img_key}]" if _img_key else None
+                else:
+                    text = self._extract_text_from_raw_content(
+                        msg_type=msg_type,
+                        raw_content=raw_content,
+                        mentions=mentions,
+                    )
                 if not text or text == "👋":
                     continue
                 # Resolve name: cache → mentions → API (known_bot_names → bot API) → fallback
