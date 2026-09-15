@@ -2644,7 +2644,7 @@ def _build_top_level_description() -> str:
         )
 
     return (
-        "Spawn one or more subagents to work on tasks in isolated contexts. "
+        "Spawn one or more subagents to work on tasks in separate contexts. "
         "Each subagent gets its own conversation, terminal session, and toolset. "
         "Only the final summary is returned -- intermediate tool results "
         "never enter your context window.\n\n"
@@ -2706,7 +2706,7 @@ def _build_tasks_param_description() -> str:
     return (
         f"Batch mode: tasks to run in parallel (up to {max_children} for this "
         f"user, set via delegation.max_concurrent_children). Each gets "
-        "its own subagent with isolated context and terminal session. "
+        "its own subagent with separate context and terminal session. "
         "When provided, top-level goal/context/toolsets are ignored."
     )
 
@@ -2781,7 +2781,7 @@ DELEGATE_TASK_SCHEMA = {
     # avoids forcing cli.CLI_CONFIG to load before the test conftest can
     # redirect HERMES_HOME.
     "description": (
-        "Spawn one or more subagents in isolated contexts. "
+        "Spawn one or more subagents in separate contexts. "
         "Description is rebuilt at every get_definitions() call to reflect "
         "the user's current delegation limits."
     ),
