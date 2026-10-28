@@ -4731,10 +4731,10 @@ class FeishuAdapter(BasePlatformAdapter):
     # --- Mention detection ----------------------------------------------------
 
     def _mentions_self(self, message: Any) -> bool:
-        # @_all is Feishu's @everyone placeholder.
+        # @_all (Feishu @everyone placeholder) deliberately does NOT trigger
+        # admission: per 好运宝宝 2026-10-28, @everyone must not wake every bot
+        # in the family. Only a direct @ of this bot admits the message.
         raw_content = getattr(message, "content", "") or ""
-        if "@_all" in raw_content:
-            return True
         mentions = getattr(message, "mentions", None) or []
         if mentions and self._message_mentions_bot(mentions):
             return True

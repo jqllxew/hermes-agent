@@ -407,6 +407,42 @@ class FeishuGroupRule:
     require_mention: Optional[bool] = None  # None = inherit global
 
 
+# TTL (seconds) for the manual-at marker written by say_to_X.py scripts.
+# If a script manually @-mentioned the reply target this many seconds ago,
+# the auto trailing @mention is skipped to avoid duplicate @.
+_MANUAL_AT_MARKER_TTL = 10.0
+
+
+def _recent_manual_at(open_id: str) -> bool:
+    """Check the profile-level manual-at marker written by say_to_X.py.
+
+    Marker file: <hermes_home>/runtime/last_manual_at.json with fields
+    {"target_open_id", "target_name", "ts"}. Returns True (and consumes the
+    marker) when the same open_id was manually @-mentioned within TTL.
+    """
+    import time as _time
+
+    marker_path = os.path.join(str(get_hermes_home()), "runtime", "last_manual_at.json")
+    try:
+        with open(marker_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return False
+    try:
+        fresh = (_time.time() - float(data.get("ts", 0))) < _MANUAL_AT_MARKER_TTL
+    except (TypeError, ValueError):
+        fresh = False
+    if not fresh:
+        return False
+    if str(data.get("target_open_id") or "") != str(open_id):
+        return False
+    try:
+        os.remove(marker_path)
+    except OSError:
+        pass
+    return True
+
+
 @dataclass
 class FeishuBatchState:
     events: Dict[str, MessageEvent] = field(default_factory=dict)
@@ -1847,7 +1883,7 @@ class FeishuAdapter(BasePlatformAdapter):
             if target:
                 open_id = target.get("open_id")
                 name = target.get("name")
-                if open_id and f'<at user_id="{open_id}"' not in all_text:
+                if open_id and f'<at user_id="{open_id}"' not in all_text and not _recent_manual_at(open_id):
                     at_text = f'<at user_id="{open_id}">@{name}</at> 👋'
                     at_payload = json.dumps({"text": at_text}, ensure_ascii=False)
                     logger.info("[Feishu] Auto @mention: reply_to=%s target=%s has_at=%s",
@@ -4393,10 +4429,9 @@ class FeishuAdapter(BasePlatformAdapter):
     # --- Mention detection ----------------------------------------------------
 
     def _mentions_self(self, message: Any) -> bool:
-        # @_all is Feishu's @everyone placeholder.
-        raw_content = getattr(message, "content", "") or ""
-        if "@_all" in raw_content:
-            return True
+        # @_all (Feishu @everyone placeholder) deliberately does NOT trigger
+        # admission: per 好运宝宝 2026-10-28, @everyone must not wake every bot
+        # in the family. Only a direct @ of this bot admits the message.
         mentions = getattr(message, "mentions", None) or []
         if mentions and self._message_mentions_bot(mentions):
             return True
